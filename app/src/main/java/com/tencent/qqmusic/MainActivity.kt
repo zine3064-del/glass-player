@@ -3,6 +3,7 @@ package com.tencent.qqmusic
 import android.Manifest
 import android.content.ComponentName
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -41,13 +42,41 @@ import androidx.media3.session.SessionToken
 import coil.compose.AsyncImage
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
-import com.tencent.qqmusic.data.LrcParser
 import com.tencent.qqmusic.data.MediaScanner
 import com.tencent.qqmusic.data.TrackItem
 import com.tencent.qqmusic.data.UserPlaylist
 import com.tencent.qqmusic.service.PlaybackService
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.delay
+
+private data class LrcEntry(
+    val timeMs: Long,
+    val text: String
+)
+
+private fun parseSimpleLrc(rawContent: String): List<LrcEntry> {
+    val entries = mutableListOf<LrcEntry>()
+    val regex = Regex("""\[(\d{2}):(\d{2})(?:\.(\d{1,3}))?](.*)""")
+    rawContent.lines().forEach { line ->
+        val match = regex.find(line.trim()) ?: return@forEach
+        val minutes = match.groupValues[1].toLongOrNull() ?: 0L
+        val seconds = match.groupValues[2].toLongOrNull() ?: 0L
+        val millisRaw = match.groupValues[3]
+        val millis = when (millisRaw.length) {
+            1 -> (millisRaw.toLongOrNull() ?: 0L) * 100L
+            2 -> (millisRaw.toLongOrNull() ?: 0L) * 10L
+            3 -> millisRaw.toLongOrNull() ?: 0L
+            else -> 0L
+        }
+        val lyricText = match.groupValues[4].trim()
+        if (lyricText.isNotEmpty()) {
+            val totalMs = minutes * 60_000L + seconds * 1_000L + millis
+            entries.add(LrcEntry(timeMs = totalMs, text = lyricText))
+        }
+    }
+    return entries.sortedBy { it.timeMs }
+}
 
 class MainActivity : ComponentActivity() {
     private var controllerFuture: ListenableFuture<MediaController>? = null
@@ -144,8 +173,8 @@ fun GlassMusicPlayerApp(
 
     var tracks by remember { mutableStateOf<List<TrackItem>>(emptyList()) }
     var playlists by remember { mutableStateOf<List<UserPlaylist>>(emptyList()) }
-    var selectedNavTab by remember { mutableIntStateOf(0) } // 0 = Library, 1 = YouTube
-    var selectedLibrarySection by remember { mutableIntStateOf(0) } // 0 = Songs, 1 = Playlists, 2 = Artists, 3 = Albums
+    var selectedNavTab by remember { mutableIntStateOf(0) }
+    var selectedLibrarySection by remember { mutableIntStateOf(0) }
     var searchQuery by remember { mutableStateOf("") }
     var showFullPlayer by remember { mutableStateOf(false) }
 
@@ -199,7 +228,7 @@ fun GlassMusicPlayerApp(
             currentPosMs = ctrl.currentPosition.coerceAtLeast(0L)
             val dur = ctrl.duration
             if (dur > 0L) durationMs = dur
-            kotlinx.coroutines.delay(400L)
+            delay(400L)
         }
     }
 
@@ -674,7 +703,7 @@ private fun YouTubeSearchTabView(
     var query by remember { mutableStateOf("") }
     var endpointUrl by remember { mutableStateOf("") }
     var statusMessage by remember {
-        mutableStateOf("Enter a song query. Connect a local or personal audio downloader endpoint to save audio files into Music.")
+        mutableStateOf("Enter a song query. Connect a personal downloader API/endpoint URL to save audio files locally.")
     }
 
     Column(
@@ -707,9 +736,9 @@ private fun YouTubeSearchTabView(
                 if (query.isBlank()) {
                     statusMessage = "Type a song title first."
                 } else if (endpointUrl.isBlank()) {
-                    statusMessage = "Ready for \"$query\": direct YouTube audio extraction requires a downloader API/endpoint URL."
+                    statusMessage = "Ready for \"$query\": enter a downloader API/endpoint URL to fetch and save locally."
                 } else {
-                    statusMessage = "Queued \"$query\" via configured endpoint. Refresh library after download finishes."
+                    statusMessage = "Queued \"$query\". Refresh library once the audio file is saved locally."
                     onLibraryUpdated()
                 }
             },
@@ -780,22 +809,22 @@ private fun FullGlassPlayerSheet(
     onNext: () -> Unit,
     onPrevious: () -> Unit
 ) {
-    val context = LocalContext.current
-    val lyricsLines = remember(track.dataPath) {
-        if (track.dataPath.isBlank()) emptyList()
-        else {
+    val lyricsLines: List<LrcEntry> = remember(track.dataPath) {
+        if (track.dataPath.isBlank()) {
+            emptyList()
+        } else {
             val audioFile = File(track.dataPath)
             val lrcFile = File(audioFile.parentFile, "${audioFile.nameWithoutExtension}.lrc")
             if (lrcFile.exists()) {
-                runCatching { LrcParser.parse(lrcFile.readText()) }.getOrElse { emptyList() }
+                runCatching { parseSimpleLrc(lrcFile.readText()) }.getOrElse { emptyList() }
             } else {
                 emptyList()
             }
         }
     }
 
-    val activeLyric = remember(lyricsLines, positionMs) {
-        lyricsLines.lastOrNull { it.timeMs <= positionMs }?.text ?: ""
+    val activeLyric: String = remember(lyricsLines, positionMs) {
+        lyricsLines.lastOrNull { entry: LrcEntry -> entry.timeMs <= positionMs }?.text ?: ""
     }
 
     Column(
@@ -916,7 +945,7 @@ private fun BottomGlassNavBar(
 
 @Composable
 private fun TrackArtworkBox(
-    uri: android.net.Uri?,
+    uri: Uri?,
     size: Int
 ) {
     Box(
